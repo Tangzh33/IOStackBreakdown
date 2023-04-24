@@ -1,0 +1,392 @@
+#!/usr/bin/env python
+# @lint-avoid-python-3-compatibility-imports
+#
+# IOStackBreakdown: Break down the latency of Linux Kernel I/O Stack
+#           For Linux, uses BCC, eBPF.
+#
+#
+# 12-Feb-2023   Zhe Tang   Created this.
+
+from __future__ import print_function
+from bcc import BPF
+from time import sleep, strftime
+import argparse
+import os
+
+# symbols
+kallsyms = "/proc/kallsyms"
+
+# define BPF program
+bpf_text = """
+#include <uapi/linux/ptrace.h>
+#include <linux/fs.h>
+#include <linux/sched.h>
+#include <linux/blk-mq.h>
+
+#define OP_NAME_LEN 8
+typedef struct dist_key {
+    char op[OP_NAME_LEN];
+    u64 slot;
+} dist_key_t;
+
+typedef struct dist_total {
+    char op[OP_NAME_LEN];
+    // u64 time;
+} dist_total_t;
+
+BPF_HASH(start, u32);
+BPF_HASH(bio_start, struct request *);
+BPF_HASH(total, struct dist_total);
+BPF_HISTOGRAM(dist, dist_key_t);
+
+// time operation
+int trace_entry(struct pt_regs *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
+
+    if (FILTER_PID)
+        return 0;
+    u64 ts = bpf_ktime_get_ns();
+    start.update(&tid, &ts);
+    return 0;
+}
+
+
+EXT4_TRACE_READ_CODE
+
+static int trace_return(struct pt_regs *ctx, const char *op)
+{
+    u64 *tsp;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
+
+    // fetch timestamp and calculate delta
+    tsp = start.lookup(&tid);
+    if (tsp == 0) {
+        return 0;   // missed start or filtered
+    }
+    u64 delta = bpf_ktime_get_ns() - *tsp;
+    start.delete(&tid);
+
+    // Skip entries with backwards time: temp workaround for #728
+    if ((s64) delta < 0)
+        return 0;
+
+    delta /= FACTOR;
+
+    // store as histogram
+    dist_key_t key = {.slot = bpf_log2l(delta)};
+    __builtin_memcpy(&key.op, op, sizeof(key.op));
+    dist.atomic_increment(key);
+
+
+    dist_total_t _total;
+    //char _op[OP_NAME_LEN];
+    __builtin_memcpy(&_total.op, op, sizeof(_total.op));
+    total.increment(_total, delta);
+
+    return 0;
+}
+
+
+
+int trace_ext_read_return(struct pt_regs *ctx)
+{
+    char *op = "extread";
+    return trace_return(ctx, op);
+}
+
+int trace_ext_write_return(struct pt_regs *ctx)
+{
+    char *op = "extwrite";
+    return trace_return(ctx, op);
+}
+
+int trace_ext_open_return(struct pt_regs *ctx)
+{
+    char *op = "extopen";
+    return trace_return(ctx, op);
+}
+
+int trace_ext_fsync_return(struct pt_regs *ctx)
+{
+    char *op = "extfsync";
+    return trace_return(ctx, op);
+}
+
+int trace_vfs_read_return(struct pt_regs *ctx)
+{
+    char *op = "vfs_r";
+    return trace_return(ctx, op);
+}
+int trace_vfs_write_return(struct pt_regs *ctx)
+{
+    char *op = "vfs_w";
+    return trace_return(ctx, op);
+}
+int trace_vfs_open_return(struct pt_regs *ctx)
+{
+    char *op = "vfs_o";
+    return trace_return(ctx, op);
+}
+int trace_vfs_sync_return(struct pt_regs *ctx)
+{
+    char *op = "vfs_s";
+    return trace_return(ctx, op);
+}
+int trace_syscall_read_return(struct pt_regs *ctx)
+{
+    char *op = "sysc_r";
+    return trace_return(ctx, op);
+}
+int trace_syscall_write_return(struct pt_regs *ctx)
+{
+    char *op = "sysc_w";
+    return trace_return(ctx, op);
+}
+int trace_syscall_sync_return(struct pt_regs *ctx)
+{
+    char *op = "sysc_s";
+    return trace_return(ctx, op);
+}
+
+int trace_bio_entry(struct pt_regs *ctx, struct request *req)
+{
+    DISK_FILTER
+
+    bpf_trace_printk("[BIO Debug]\\n");
+    u64 ts = bpf_ktime_get_ns();
+    bio_start.update(&req, &ts);
+    return 0;
+}
+
+
+int trace_bio_return(struct pt_regs *ctx, struct request *req)
+{
+    u64 *tsp, delta;
+    char op[OP_NAME_LEN] = "bio_op";
+
+    // fetch timestamp and calculate delta
+    tsp = bio_start.lookup(&req);
+    if (tsp == 0) {
+        return 0;   // missed issue
+    }
+    delta = bpf_ktime_get_ns() - *tsp;
+
+    // Skip entries with backwards time: temp workaround for #728
+    if ((s64) delta < 0)
+        return 0;
+
+    delta /= FACTOR;
+
+    // store as histogram
+    dist_key_t key = {.slot = bpf_log2l(delta)};
+    __builtin_memcpy(&key.op, op, sizeof(key.op));
+    dist.atomic_increment(key);
+
+
+    dist_total_t _total;
+    __builtin_memcpy(&_total.op, op, sizeof(_total.op));
+    total.increment(_total, delta);
+
+    bio_start.delete(&req);
+    return 0;
+}
+"""
+
+"""Configuring Parameters"""
+examples = """examples:
+    ./IOStackBreakdown -T syscall -p 6681
+    ./IOStackBreakdown -T vfs -p 6688
+    ./IOStackBreakdown -T ext4 -p 6706
+    ./IOStackBreakdown -T blk -d nvme0n1 -Q
+"""
+parser = argparse.ArgumentParser(
+    description="Summarize ext4 operation latency",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("-m", "--milliseconds", action="store_true",
+    help="output in milliseconds")
+parser.add_argument("-p", "--pid",
+    help="trace this PID only")
+parser.add_argument("-Q", "--queued", action="store_true",
+    help="include OS queued time in I/O time")
+parser.add_argument("-T", "--type", help="trace this I/O Layer only")
+parser.add_argument("-d", "--disk", type=str,
+    help="Trace this disk only")
+
+args = parser.parse_args()
+pid = args.pid
+if args.milliseconds:
+    factor = 1000000
+    label = "msecs"
+else:
+    factor = 1
+    label = "nsecs"
+debug = 0
+
+"""Setting up Correct bpf function"""
+# Starting from Linux 4.10 ext4_file_operations.read_iter has been changed from
+# using generic_file_read_iter() to its own ext4_file_read_iter().
+#
+# To detect the proper function to trace check if ext4_file_read_iter() is
+# defined in /proc/kallsyms, if it's defined attach to that function, otherwise
+# use generic_file_read_iter() and inside the trace hook filter on ext4 read
+# events (checking if file->f_op == ext4_file_operations).
+if BPF.get_kprobe_functions(b'ext4_file_read_iter'):
+    ext4_read_fn = 'ext4_file_read_iter'
+    ext4_trace_read_fn = 'trace_entry'
+    ext4_trace_read_code = ''
+else:
+    ext4_read_fn = 'generic_file_read_iter'
+    ext4_trace_read_fn = 'trace_read_entry'
+    ext4_file_ops_addr = ''
+    with open(kallsyms) as syms:
+        for line in syms:
+            (addr, size, name) = line.rstrip().split(" ", 2)
+            name = name.split("\t")[0]
+            if name == "ext4_file_operations":
+                ext4_file_ops_addr = "0x" + addr
+                break
+        if ext4_file_ops_addr == '':
+            print("ERROR: no ext4_file_operations in /proc/kallsyms. Exiting.")
+            print("HINT: the kernel should be built with CONFIG_KALLSYMS_ALL.")
+            exit()
+    ext4_trace_read_code = """
+int trace_read_entry(struct pt_regs *ctx, struct kiocb *iocb)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
+
+    if (FILTER_PID)
+        return 0;
+
+    // ext4 filter on file->f_op == ext4_file_operations
+    struct file *fp = iocb->ki_filp;
+    if ((u64)fp->f_op != %s)
+        return 0;
+
+    u64 ts = bpf_ktime_get_ns();
+    start.update(&tid, &ts);
+    return 0;
+}""" % ext4_file_ops_addr
+
+# code replacements
+bpf_text = bpf_text.replace('EXT4_TRACE_READ_CODE', ext4_trace_read_code)
+bpf_text = bpf_text.replace('FACTOR', str(factor))
+if args.pid:
+    bpf_text = bpf_text.replace('FILTER_PID', 'pid != %s' % pid)
+else:
+    bpf_text = bpf_text.replace('FILTER_PID', '0')
+
+if args.disk is not None:
+    disk_path = os.path.join('/dev', args.disk)
+    if not os.path.exists(disk_path):
+        print("no such disk '%s'" % args.disk)
+        exit(1)
+
+    stat_info = os.stat(disk_path)
+    major = os.major(stat_info.st_rdev)
+    minor = os.minor(stat_info.st_rdev)
+
+    disk_field_str = ""
+    if BPF.kernel_struct_has_field(b'request', b'rq_disk') == 1:
+        disk_field_str = 'req->rq_disk'
+    else:
+        disk_field_str = 'req->q->disk'
+
+    disk_filter_str = """
+    struct gendisk *disk = %s;
+    if (!(disk->major == %d && disk->first_minor == %d)) {
+        return 0;
+    }
+    """ % (disk_field_str, major, minor)
+
+    bpf_text = bpf_text.replace('DISK_FILTER', disk_filter_str)
+else:
+    bpf_text = bpf_text.replace('DISK_FILTER', '')
+
+# load BPF program
+b = BPF(text=bpf_text)
+
+"""Attaching Kprobes"""
+# Attaching Syscall Events
+if args.type == "syscall":
+    # Can be ksys_* or __x64_*
+    b.attach_kprobe(event="__x64_sys_read", fn_name="trace_entry")
+    b.attach_kretprobe(event="__x64_sys_read", fn_name="trace_syscall_read_return")
+    b.attach_kprobe(event="__x64_sys_write", fn_name="trace_entry")
+    b.attach_kretprobe(event="__x64_sys_write", fn_name="trace_syscall_write_return")
+    b.attach_kprobe(event="__x64_sys_sync", fn_name="trace_entry")
+    b.attach_kretprobe(event="__x64_sys_sync", fn_name="trace_syscall_sync_return")
+    
+
+
+# Attaching VFS Events
+if args.type == "vfs":
+    b.attach_kprobe(event = "vfs_read", fn_name="trace_entry")
+    b.attach_kretprobe(event = "vfs_read", fn_name="trace_vfs_read_return")
+    b.attach_kprobe(event_re = "vfs_write", fn_name="trace_entry")
+    b.attach_kretprobe(event_re = "vfs_write", fn_name="trace_vfs_write_return")
+    b.attach_kprobe(event = "vfs_open", fn_name="trace_entry")
+    b.attach_kretprobe(event = "vfs_open", fn_name="trace_vfs_open_return")
+    b.attach_kprobe(event = "vfs_fsync", fn_name="trace_entry")
+    b.attach_kretprobe(event = "vfs_fsync", fn_name="trace_vfs_sync_return")
+
+# Attaching EXT-FS Events
+if args.type == "ext4":
+    b.attach_kprobe(event=ext4_read_fn, fn_name=ext4_trace_read_fn)
+    b.attach_kretprobe(event=ext4_read_fn, fn_name='trace_ext_read_return')
+    b.attach_kprobe(event="ext4_file_write_iter", fn_name="trace_entry")
+    b.attach_kretprobe(event="ext4_file_write_iter", fn_name="trace_ext_write_return")
+    b.attach_kprobe(event="ext4_file_open", fn_name="trace_entry")
+    b.attach_kretprobe(event="ext4_file_open", fn_name="trace_ext_open_return")
+    b.attach_kprobe(event="ext4_sync_file", fn_name="trace_entry")
+    b.attach_kretprobe(event="ext4_sync_file", fn_name="trace_ext_fsync_return")
+
+
+# Attaching Block I/O stacks
+if args.type == "blk":
+    if args.queued:
+        if BPF.get_kprobe_functions(b'__blk_account_io_start'):
+            b.attach_kprobe(event="__blk_account_io_start", fn_name="trace_bio_entry")
+        else:
+            b.attach_kprobe(event="blk_account_io_start", fn_name="trace_bio_entry")
+    else:
+        if BPF.get_kprobe_functions(b'blk_start_request'):
+            b.attach_kprobe(event="blk_start_request", fn_name="trace_bio_entry")
+        b.attach_kprobe(event="blk_mq_start_request", fn_name="trace_bio_entry")
+    if BPF.get_kprobe_functions(b'__blk_account_io_done'):
+        b.attach_kprobe(event="__blk_account_io_done", fn_name="trace_bio_return")
+    else:
+        b.attach_kprobe(event="blk_account_io_done", fn_name="trace_bio_return")
+
+
+print("Breaking Down Linux IO Stack's operation latency... Hit Ctrl-C to end.")
+# b.trace_print()
+
+"""Output Result with Sum of Latency and Histogram"""
+exiting = 0
+dist = b.get_table("dist")
+total = b.get_table("total")
+
+while (1):
+    try:
+        sleep(99999999)
+    except KeyboardInterrupt:
+        exiting = 1
+
+    print()
+    print(strftime("%H:%M:%S"))
+
+    dist.print_log2_hist(label, "operation", section_print_fn=bytes.decode)
+    dist.clear()
+
+    for k,v in sorted(total.items(), key=lambda total: total[1].value):
+        print("{}, {}ns ".format(k.op,v.value))
+    if exiting:
+        exit()
